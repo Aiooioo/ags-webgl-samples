@@ -1,5 +1,5 @@
 # ags-webgl-samples
-Sample demos using ArcGIS API for JavaScript with WebGL
+
 ArcGIS Web App中一些常见的3D WebGL特效的实现Demo
 
 ## 3d-warning-point
