@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0"
+    />
+    <meta http-equiv="X-UA-Compatible" content="ie=edge" />
+    <title>移植ArcGIS官方SDK中2D自定义的水波纹特效</title>
+    <link
+      rel="stylesheet"
+      href="https://js.arcgis.com/4.13/esri/css/main.css"
+    />
+    <style>
+      html,
+      body,
+      #viewDiv {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        width: 100%;
+      }
+    </style>
+    <script type="x-shader/x-vertex" id="vshader">
+      precision highp float;
+      attribute vec3 aVertexPosition;
+      attribute vec3 aVertexNormal;
+      uniform mat4 uModelViewMatrix;
+      uniform mat4 uProjectionMatrix;
+      uniform mat3 uNormalMatrix;
+      uniform vec3 uAmbientColor;
+      uniform vec3 uLightingDirection;
+      uniform vec3 uDirectionalColor;
+
+      uniform mat3 u_transform;
+      uniform mat3 u_display;
+      attribute vec2 a_offset;
+      varying vec2 v_offset;
+      const float SIZE = 70.0;
+
+      void main() {
+        gl_Position = uProjectionMatrix * uModelViewMatrix * vec4(aVertexPosition, 1.0);
+        vec3 transformedNormal = normalize(uNormalMatrix * aVertexNormal);
+
+        float directionalLightWeighting = max(dot(transformedNormal, uLightingDirection), 0.0);
+
+        gl_PointSize = 10.0;
+        v_offset = a_offset;
+      }
+    </script>
+    <script type="x-shader/x-fragment" id="fshader">
+      precision highp float;
+      uniform float u_current_time;
+      varying vec2 v_offset;
+
+      const float PI = 3.14159;
+      const float N_RINGS = 3.0;
+      const vec3 COLOR = vec3(0.23, 0.43, 0.70);
+      const float FREQ = 1.0;
+
+      void main() {
+        float l = length(v_offset);
+        float intensity = clamp(cos(l * PI), 0.0, 1.0) * clamp(cos(2.0 * PI * (l * 2.0 *N_RINGS - FREQ *  u_current_time)), 0.0, 1.0);
+
+        gl_FragColor = vec4(COLOR * intensity, intensity);
+      }
+    </script>
+  </head>
+  <body>
+    <div id="viewDiv"></div>
+    <script src="https://js.arcgis.com/4.13/"></script>
+    <script>
+      require([
+        "esri/core/declare",
+        "esri/geometry/SpatialReference",
+        "esri/Map",
+
+        "esri/views/SceneView",
+        "https://cdnjs.cloudflare.com/ajax/libs/gl-matrix/2.3.2/gl-matrix-min.js",
+        "esri/views/3d/externalRenderers"
+      ], function(
+        declare,
+        SpatialReference,
+        Map,
+        SceneView,
+        glMatrix,
+        externalRenderers
+      ) {
+        var samples = [[116.24, 39.55], [117.12, 39.02]];
+
+        var map = new Map({
+          basemap: "osm"
+        });
+
+        var view = new SceneView({
+          map: map,
+          container: document.getElementById("viewDiv"),
+          camera: {
+            heading: 0.1653984525583375,
+            tilt: 0.4999486160013297,
+            position: {
+              x: 12939796.2731216,
+              y: 4800743.332382973,
+              z: 712.8388782627881,
+              spatialReference: {
+                wkid: 102100
+              }
+            }
+          }
+        });
+
+        // view.map.ground.opacity = 0.4;
+        window.view = view;
+
+        var customRenderer = declare(null, {
+          view: null,
+          points: null,
+
+          numPoints: null,
+
+          // Local origin
+          localOrigin: null,
+          localOriginRender: null,
+
+          // Vertex and index buffers
+          vboBasePositions: null,
+          vboBaseNormals: null,
+          vboBaseOffset: null,
+          iboBase: null,
+
+          // Vertex and index data
+          pointBasePositions: null,
+          pointBaseNormals: null,
+          pointBaseIndices: null,
+          pointBaseOffsets: null,
+
+          // Shader
+          program: null,
+
+          // Shader attribute and uniform locations
+          programAttribVertexPosition: null,
+          programAttribVertexNormal: null,
+          programAttribOffset: null,
+          programUniformProjectionMatrix: null,
+          programUniformModelViewMatrix: null,
+          programUniformNormalMatrix: null,
+          programUniformAmbientColor: null,
+          programUniformLightingDirection: null,
+          programUniformDirectionalColor: null,
+
+          // Per-instance data
+          pointInstanceInputToRender: null,
+
+          // Temporary matrices and vectors,
+          // used to avoid allocating objects in each frame.
+          tempMatrix4: new Float32Array(16),
+          tempMatrix3: new Float32Array(9),
+          tempVec3: new Float32Array(3),
+
+          constructor: function() {
+            // Whether the vertex and index buffers need to be updated
+            // due to a change in the layer data.
+            this.needsUpdate = false;
+          },
+
+          setup: function(context) {
+            this.initShaders(context);
+            // init data
+            this.initData(context, samples);
+
+            // cleanup
+            context.resetWebGLState();
+          },
+
+          render: function(context) {
+            var gl = context.gl;
+
+            // Set some global WebGL state
+            // State will be reset between each render() call
+            gl.enable(gl.DEPTH_TEST);
+            gl.disable(gl.CULL_FACE);
+            gl.disable(gl.BLEND);
+
+            // Enable our shader
+            gl.useProgram(this.program);
+            this.setCommonUniforms(context);
+
+            this.bindPointBase(context);
+            glMatrix.mat4.identity(this.tempMatrix4);
+
+            // Apply local origin by translation the view matrix by the local origin, this will
+            // put the view origin (0, 0, 0) at the local origin
+            glMatrix.mat4.translate(
+              this.tempMatrix4,
+              this.tempMatrix4,
+              this.localOriginRender
+            );
+            glMatrix.mat4.multiply(
+              this.tempMatrix4,
+              context.camera.viewMatrix,
+              this.tempMatrix4
+            );
+            gl.uniformMatrix4fv(
+              this.programUniformModelViewMatrix,
+              false,
+              this.tempMatrix4
+            );
+
+            // Normals are in world coordinates, normal transformation is therefore identity
+            glMatrix.mat3.identity(this.tempMatrix3);
+            gl.uniformMatrix3fv(
+              this.programUniformNormalMatrix,
+              false,
+              this.tempMatrix3
+            );
+
+            gl.enable(gl.BLEND);
+            gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+            gl.drawElements(
+              gl.TRIANGLES,
+              // gl.POINTS,
+              this.pointBaseIndices.length,
+              gl.UNSIGNED_SHORT,
+              0
+            );
+            // gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+            // Draw continuously
+            externalRenderers.requestRender(view);
+
+            // cleanup
+            context.resetWebGLState();
+          },
+
+          /**
+           * Loads a shader from a <script> html tag
+           */
+          getShader: function(gl, id) {
+            var shaderScript = document.getElementById(id);
+            if (!shaderScript) {
+              return null;
+            }
+
+            var str = "";
+            var k = shaderScript.firstChild;
+            while (k) {
+              if (k.nodeType == 3) {
+                str += k.textContent;
+              }
+              k = k.nextSibling;
+            }
+
+            var shader;
+            if (shaderScript.type == "x-shader/x-fragment") {
+              shader = gl.createShader(gl.FRAGMENT_SHADER);
+            } else if (shaderScript.type == "x-shader/x-vertex") {
+              shader = gl.createShader(gl.VERTEX_SHADER);
+            } else {
+              return null;
+            }
+
+            gl.shaderSource(shader, str);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+              alert(gl.getShaderInfoLog(shader));
+              return null;
+            }
+
+            return shader;
+          },
+
+          /**
+           * Links vertex and fragment shaders into a GLSL program
+           */
+          linkProgram: function(gl, fragmentShader, vertexShader) {
+            var shaderProgram = gl.createProgram();
+
+            gl.attachShader(shaderProgram, vertexShader);
+            gl.attachShader(shaderProgram, fragmentShader);
+            gl.linkProgram(shaderProgram);
+
+            if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
+              return null;
+            }
+
+            return shaderProgram;
+          },
+
+          /**
+           * Initializes all shaders requried by the application
+           */
+          initShaders: function(context) {
+            var gl = context.gl;
+
+            var fragmentShader = this.getShader(gl, "fshader");
+            var vertexShader = this.getShader(gl, "vshader");
+            this.program = this.linkProgram(gl, fragmentShader, vertexShader);
+            if (!this.program) {
+              alert("Could not initialise shaders");
+            }
+
+            gl.useProgram(this.program);
+
+            // Program attributes
+            this.programAttribVertexPosition = gl.getAttribLocation(
+              this.program,
+              "aVertexPosition"
+            );
+            gl.enableVertexAttribArray(this.programAttribVertexPosition);
+
+            this.programAttribVertexNormal = gl.getAttribLocation(
+              this.program,
+              "aVertexNormal"
+            );
+            gl.enableVertexAttribArray(this.programAttribVertexNormal);
+
+            this.programAttribOffset = gl.getAttribLocation(
+              this.program,
+              "a_offset"
+            );
+            gl.enableVertexAttribArray(this.programAttribOffset);
+
+            // Program uniforms
+            this.programUniformProjectionMatrix = gl.getUniformLocation(
+              this.program,
+              "uProjectionMatrix"
+            );
+            this.programUniformModelViewMatrix = gl.getUniformLocation(
+              this.program,
+              "uModelViewMatrix"
+            );
+            this.programUniformNormalMatrix = gl.getUniformLocation(
+              this.program,
+              "uNormalMatrix"
+            );
+            this.programUniformAmbientColor = gl.getUniformLocation(
+              this.program,
+              "uAmbientColor"
+            );
+            this.programUniformLightingDirection = gl.getUniformLocation(
+              this.program,
+              "uLightingDirection"
+            );
+            this.programUniformDirectionalColor = gl.getUniformLocation(
+              this.program,
+              "uDirectionalColor"
+            );
+            this.uDisplay = gl.getUniformLocation(this.program, "u_display");
+            this.uCurrentTime = gl.getUniformLocation(
+              this.program,
+              "u_current_time"
+            );
+          },
+
+          initData: function(context, data) {
+            var gl = context.gl;
+            this.numPoints = data.length; // 2
+
+            // Choose a local origin.
+            // In our case, we simply use the map center.
+            // For global scenes, you'll need multiple local origins.
+            var localOriginSR = view.extent.center.spatialReference;
+            this.localOrigin = [view.extent.center.x, view.extent.center.y, 0];
+
+            // Calculate local origin in render coordinates with 32bit precision
+            this.localOriginRender = externalRenderers.toRenderCoordinates(
+              view,
+              this.localOrigin,
+              0,
+              localOriginSR,
+              new Float32Array(3),
+              0,
+              1
+            );
+
+            // Extract station data into flat arrays. speed & rpm .etc
+            this.pointInstanceInputToRender = new Array(this.numPoints);
+
+            for (var i = 0; i < this.numPoints; ++i) {
+              var point = data[i];
+              var inputSR = new SpatialReference({ wkid: 4326 });
+              var inputPoint = [point[0], point[1], 10];
+              var inputToRender = externalRenderers.renderCoordinateTransformAt(
+                view,
+                inputPoint,
+                inputSR,
+                new Float64Array(16)
+              );
+              this.pointInstanceInputToRender[i] = inputToRender;
+            }
+
+            this.pointBasePositions = new Float64Array(this.numPoints * 3 * 4);
+            this.pointBaseNormals = new Float64Array(this.numPoints * 3 * 4);
+            this.pointBaseIndices = new Uint16Array(this.numPoints * 6);
+            this.pointBaseOffsets = new Float64Array(this.numPoints * 2 * 4);
+
+            for (var i = 0; i < this.numPoints; i++) {
+              // Transformation of positions from local to render coordinates
+              var positionMatrix = new Float64Array(16);
+              glMatrix.mat4.identity(positionMatrix);
+              glMatrix.mat4.multiply(
+                positionMatrix,
+                this.pointInstanceInputToRender[i],
+                positionMatrix
+              );
+
+              // Transformation of normals from local to render coordinates
+              var normalMatrix = new Float64Array(9);
+              glMatrix.mat3.normalFromMat4(normalMatrix, positionMatrix);
+
+              // Append vertex and index data
+              var numCoordinates = 4 * 3;
+              var numVertices = numCoordinates / 3;
+              // for (var j = 0; j < numCoordinates; ++j) {
+              // this.pointBasePositions[i * numCoordinates + j] = 0;
+              // this.pointBaseNormals[i * numCoordinates + j] = 0;
+
+              this.pointBaseOffsets[i * 8 + 0] = -0.5;
+              this.pointBaseOffsets[i * 8 + 1] = -0.5;
+              this.pointBaseOffsets[i * 8 + 2] = 0.5;
+              this.pointBaseOffsets[i * 8 + 3] = -0.5;
+              this.pointBaseOffsets[i * 8 + 4] = -0.5;
+              this.pointBaseOffsets[i * 8 + 5] = 0.5;
+              this.pointBaseOffsets[i * 8 + 6] = 0.5;
+              this.pointBaseOffsets[i * 8 + 7] = 0.5;
+
+              var size = 70 / 2;
+              var scale = size; // / view.resolution;
+
+              var x = positionMatrix[12];
+              var y = positionMatrix[13];
+              this.pointBasePositions[i * numCoordinates + 0] = -35;
+              this.pointBasePositions[i * numCoordinates + 1] = -35;
+              this.pointBasePositions[i * numCoordinates + 2] = 50;
+              this.pointBasePositions[i * numCoordinates + 3] = 35;
+              this.pointBasePositions[i * numCoordinates + 4] = -35;
+              this.pointBasePositions[i * numCoordinates + 5] = 50;
+              this.pointBasePositions[i * numCoordinates + 6] = -35;
+              this.pointBasePositions[i * numCoordinates + 7] = 35;
+              this.pointBasePositions[i * numCoordinates + 8] = 50;
+              this.pointBasePositions[i * numCoordinates + 9] = 35;
+              this.pointBasePositions[i * numCoordinates + 10] = 35;
+              this.pointBasePositions[i * numCoordinates + 11] = 50;
+              // }
+
+              // Transform vertices into render coordinates
+              glMatrix.vec3.forEach(
+                this.pointBasePositions,
+                0,
+                i * numCoordinates,
+                numVertices,
+                glMatrix.vec3.transformMat4,
+                positionMatrix
+              );
+
+              // Subtract local origin coordinates
+              glMatrix.vec3.forEach(
+                this.pointBasePositions,
+                0,
+                i * numCoordinates,
+                numVertices,
+                glMatrix.vec3.subtract,
+                this.localOriginRender
+              );
+
+              // Transform normals into render coordinates
+              glMatrix.vec3.forEach(
+                this.pointBaseNormals,
+                0,
+                i * numCoordinates,
+                numVertices,
+                glMatrix.vec3.transformMat3,
+                normalMatrix
+              );
+
+              // Re-normalize normals
+              glMatrix.vec3.forEach(
+                this.pointBaseNormals,
+                0,
+                i * numCoordinates,
+                numVertices,
+                glMatrix.vec3.normalize
+              );
+
+              // Append index data
+              var numIndices = 6;
+              // for (var j = 0; j < numIndices; ++j) {
+              // this.pointBaseIndices[i * numIndices + j] = 0 + i * numVertices;
+              // }
+              this.pointBaseIndices[i * numIndices + 0] = 0 + i * 4;
+              this.pointBaseIndices[i * numIndices + 1] = 1 + i * 4;
+              this.pointBaseIndices[i * numIndices + 2] = 2 + i * 4;
+              this.pointBaseIndices[i * numIndices + 3] = 1 + i * 4;
+              this.pointBaseIndices[i * numIndices + 4] = 3 + i * 4;
+              this.pointBaseIndices[i * numIndices + 5] = 2 + i * 4;
+            }
+
+            // Upload our data to WebGL
+            this.vboBasePositions = this.createVertexBuffer(
+              gl,
+              this.pointBasePositions
+            );
+            this.vboBaseNormals = this.createVertexBuffer(
+              gl,
+              this.pointBaseNormals
+            );
+            this.vboBaseOffset = this.createVertexBuffer(
+              gl,
+              this.pointBaseOffsets
+            );
+            this.iboBase = this.createIndexBuffer(gl, this.pointBaseIndices);
+          },
+
+          /**
+           * Creates a vertex buffer from the given data.
+           */
+          createVertexBuffer: function(gl, data) {
+            var buffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+
+            // We have filled vertex buffers in 64bit precision,
+            // convert to a format compatible with WebGL
+            var float32Data = new Float32Array(data);
+
+            gl.bufferData(gl.ARRAY_BUFFER, float32Data, gl.STATIC_DRAW);
+            return buffer;
+          },
+
+          /**
+           * Creates an index buffer from the given data.
+           */
+          createIndexBuffer: function(gl, data) {
+            var buffer = gl.createBuffer();
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buffer);
+            gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, data, gl.STATIC_DRAW);
+            return buffer;
+          },
+
+          /**
+           * Activates vertex attributes for the drawing of the windmill base.
+           */
+          bindPointBase: function(context) {
+            var gl = context.gl;
+
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.vboBasePositions);
+            gl.enableVertexAttribArray(this.programAttribVertexPosition);
+            gl.vertexAttribPointer(
+              this.programAttribVertexPosition,
+              3,
+              gl.FLOAT,
+              false,
+              0,
+              0
+            );
+
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.vboBaseNormals);
+            gl.enableVertexAttribArray(this.programAttribVertexNormal);
+            gl.vertexAttribPointer(
+              this.programAttribVertexNormal,
+              3,
+              gl.FLOAT,
+              false,
+              0,
+              0
+            );
+
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.vboBaseOffset);
+            gl.enableVertexAttribArray(this.programAttribOffset);
+            gl.vertexAttribPointer(
+              this.programAttribOffset,
+              2,
+              gl.FLOAT,
+              false,
+              0,
+              0
+            );
+
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.iboBase);
+          },
+
+          /**
+           * Returns a color vector from a {color, intensity} object.
+           */
+          getFlatColor: function(src, output) {
+            output[0] = src.color[0] * src.intensity;
+            output[1] = src.color[1] * src.intensity;
+            output[2] = src.color[2] * src.intensity;
+            return output;
+          },
+
+          /**
+           * Sets common shader uniforms
+           */
+          setCommonUniforms: function(context) {
+            var gl = context.gl;
+            var camera = context.camera;
+
+            gl.uniform1f(this.uCurrentTime, performance.now() / 1000.0);
+
+            gl.uniform3fv(
+              this.programUniformDirectionalColor,
+              this.getFlatColor(context.sunLight.diffuse, this.tempVec3)
+            );
+            gl.uniform3fv(
+              this.programUniformAmbientColor,
+              this.getFlatColor(context.sunLight.ambient, this.tempVec3)
+            );
+            gl.uniform3fv(
+              this.programUniformLightingDirection,
+              context.sunLight.direction
+            );
+
+            gl.uniformMatrix4fv(
+              this.programUniformProjectionMatrix,
+              false,
+              context.camera.projectionMatrix
+            );
+          }
+        });
+
+        view.when(function() {
+          var myRenderer = new customRenderer();
+          myRenderer.view = view;
+          myRenderer.points = samples;
+          externalRenderers.add(view, myRenderer);
+        });
+      });
+    </script>
+  </body>
+</html>
